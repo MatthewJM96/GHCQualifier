@@ -10,45 +10,69 @@
 #include <unordered_map>
 #include <functional>
 
+#pragma region DataStructures
+using ID    = size_t;
+using Count = size_t;
+
+using CachedVideos = std::vector<ID>;
+using UsedCache    = std::pair<ID, CachedVideos>;
+using UsedCaches   = std::unordered_map<ID, CachedVideos>;
+
+using VideoTimes    = std::unordered_map<ID, double>;
+using EndpointTimes = std::unordered_map<ID, VideoTimes>;
+
+using CachePriorityList = std::map<double, ID, std::greater<double>>;
+
+using SolverResponse = std::pair<ID, bool>;
+using HPCSResponse   = SolverResponse;
+using HPVSResponse   = SolverResponse;
+
+struct VideoDatum {
+    int   size;
+    Count numReq;
+};
+using VideoData = std::map<ID, VideoDatum>;
+using VideoPriorityList = std::map<double, ID, std::greater<double>>;
+
 struct Metadata {
-    size_t videoCount;
-    size_t endpointCount;
-    size_t requestCount;
-    size_t cacheCount;
-    int cacheSize;
-    int smallestVideoSize;
+    Count videoCount;
+    Count endpointCount;
+    Count requestCount;
+    Count cacheCount;
+    int   cacheSize;
+    int   smallestVideoSize;
 };
 
 struct Video {
-    size_t id;
+    ID  id;
     int size;
 };
 using Videos = std::vector<Video>;
 
 struct CacheConnection {
-    size_t cacheId;
-    int    latency;
+    ID  cacheId;
+    int latency;
 };
 using CacheConnections = std::vector<CacheConnection>;
 
 struct Request {
-    size_t id;
-    size_t videoId;
-    size_t requestCount;
+    ID    id;
+    ID    videoId;
+    Count requestCount;
 };
 using Requests = std::vector<Request>;
 
 struct Endpoint {
-    size_t           id;
+    ID               id;
     int              latency;
-    size_t           cacheCount;
+    Count            cacheCount;
     CacheConnections cacheConnections;
     Requests         requests;
 };
 using Endpoints = std::vector<Endpoint>;
 
 struct Cache {
-    size_t    id;
+    ID        id;
     Endpoints connections;
     int       remainingSpace;
 };
@@ -60,6 +84,7 @@ struct Data {
     Endpoints endpoints;
     Caches    caches;
 };
+#pragma endregion
 
 /// Model that acquires the data.
 class Loader {
@@ -305,26 +330,23 @@ template <typename State, typename Energy = double, typename Temperature = doubl
         NextFunc        m_nextFunc;
 };
 
-using UsedCaches = std::unordered_map<size_t, std::vector<size_t>>;
-using NearestTimes = std::unordered_map<size_t, std::unordered_map<size_t, double>>;
-NearestTimes getTimeToNearestStore(Data data, UsedCaches usedCaches) {
-    NearestTimes nt;
+EndpointTimes getTimeToNearestStore(Data data, UsedCaches usedCaches) {
+    EndpointTimes et;
     for (Endpoint endpoint : data.endpoints) {
-        if (nt.find(endpoint.id) == nt.end()) {
-            nt.insert({ endpoint.id, {} });
-        }
+        // Insert endpoint into nearest times var.
+        et.insert({ endpoint.id, {} });
+        // For each video request at this endpoint, add it to the nearest times var with time to nearest store of the requested video.
         for (Request request : endpoint.requests) {
-            auto& videoTimes = nt[endpoint.id];
-            if (videoTimes.find(request.videoId) == videoTimes.end()) {
-                videoTimes.insert({ request.videoId, 0.0 });
-            }
+            et[endpoint.id].insert({ request.videoId, 0.0 });
 
-            double bestTime = endpoint.latency;
+            double bestTime = endpoint.latency; // Set best time by default to be to the datacenter.
             for (auto usedCache : usedCaches) {
+                // If the video exists in any of the used caches, then see if that cache is connected to this endpoint.
                 if (std::find(usedCache.second.begin(), usedCache.second.end(), request.videoId) != usedCache.second.end()) {
                     auto& it = std::find_if(endpoint.cacheConnections.begin(), endpoint.cacheConnections.end(), [&usedCache](CacheConnection a) {
                         return a.cacheId == usedCache.first;
                     });
+                    // If a cache storing the video is connected to this endpoint, and its latency is better than the current best latency to fetch the video, set the latency of this endpoint -> this cache as the new best latency.
                     if (it != endpoint.cacheConnections.end()) {
                         if (bestTime > it->latency) {
                             bestTime = it->latency;
@@ -333,34 +355,53 @@ NearestTimes getTimeToNearestStore(Data data, UsedCaches usedCaches) {
                 }
             }
 
-            nt[endpoint.id][request.videoId] = bestTime; 
+            // Insert found best latency into nearest times var.
+            et[endpoint.id][request.videoId] = bestTime;
         }
     }
-    return nt;
+    return et;
 }
 
-using CachePriorityList = std::map<double, size_t, std::greater<double>>;
-class HighestPriorityCacheSolver : public ISolver<size_t> {
+class HighestPriorityCacheSolver : public ISolver<HPCSResponse> {
 public:
-    void init(Data data, NearestTimes nearestTimes, UsedCaches usedCaches, double weighting) {
-        m_k    = weighting;
+    ~HighestPriorityCacheSolver() {
+        dispose();
+    }
+
+    void init(Data data, EndpointTimes nearestTimes, UsedCaches usedCaches, double weighting) {
+        m_k            = weighting;
         m_nearestTimes = nearestTimes;
-        m_usedCaches = usedCaches;
-        m_data = data;
+        m_usedCaches   = usedCaches;
+        m_data         = data;
+        m_skipCount    = 0;
+    }
+    void dispose() {
+        EndpointTimes().swap(m_nearestTimes);
+        UsedCaches().swap(m_usedCaches);
+    }
+
+    void setSkipCount(Count skips) {
+        m_skipCount = skips;
     }
 
     void solve() {
         CachePriorityList cpl;
 
         for (Cache cache : m_data.caches) {
-            double goodness = calculateGoodness(cache);
-            cpl.insert({ goodness, cache.id });
+            cpl.insert({ calculateGoodness(cache), cache.id });
         }
 
+        m_result = HPCSResponse(0, false);
+        Count skips = 0;
         auto& it = cpl.begin();
         while (it != cpl.end()) {
             if (m_data.caches[it->second].remainingSpace > m_data.metadata.smallestVideoSize) {
-                m_result = it->second;
+                if (skips != m_skipCount) {
+                    ++it;
+                    ++skips;
+                    continue;
+                }
+                m_result = HPCSResponse(it->second, true);
                 break;
             }
             ++it;
@@ -372,14 +413,13 @@ private:
 
         for (Endpoint connection : cache.connections) {
             for (Request request : connection.requests) {
-                bool shouldContinue = false;
-                for (auto usedCache : m_usedCaches) {
-                    if (std::find(usedCache.second.begin(), usedCache.second.end(), request.videoId) != usedCache.second.end()) {
-                        shouldContinue = true;
-                        break;
-                    }
-                }
-                if (shouldContinue) continue;
+                // If the cache we are considering already has the video, skip.
+                auto& usedCache = std::find_if(m_usedCaches.begin(), m_usedCaches.end(), [&cache](const UsedCache& usedCache) {
+                    return usedCache.first == cache.id;
+                });
+                if (usedCache != m_usedCaches.end() && std::find(usedCache->second.begin(), usedCache->second.end(), request.videoId) != usedCache->second.end()) continue;
+
+                // Calculate goodness.
                 res += m_k * m_nearestTimes[connection.id][request.videoId] * (double)request.requestCount / (double)m_data.videos[request.videoId].size;
             }
         }
@@ -387,40 +427,46 @@ private:
         return res;
     }
 
-    Data         m_data;
-    NearestTimes m_nearestTimes;
-    UsedCaches   m_usedCaches;
-    double       m_k;
+    Data          m_data;
+    EndpointTimes m_nearestTimes;
+    UsedCaches    m_usedCaches;
+    double        m_k;
+    Count         m_skipCount;
 };
 
-struct VideoDatum {
-    int    size;
-    size_t numReq;
-};
-using VideoData         = std::map<size_t, VideoDatum>;
-using VideoPriorityList = std::map<double, size_t, std::greater<double>>;
-class HighestPriorityVideoSolver : public ISolver<size_t> {
+class HighestPriorityVideoSolver : public ISolver<HPVSResponse> {
     // Constructs priority lists for videos of a given cache.
 public:
-    void init(Data data, NearestTimes nearestTimes, UsedCaches usedCaches, size_t id) {
+    ~HighestPriorityVideoSolver() {
+        dispose();
+    }
+
+    void init(Data data, EndpointTimes nearestTimes, UsedCaches usedCaches, ID id) {
         m_nearestTimes = nearestTimes;
         m_usedCaches = usedCaches;
         m_data = data;
-        m_id   = id;
+        m_id = id;
+        m_skipCount = 0;
+    }
+    void dispose() {
+        EndpointTimes().swap(m_nearestTimes);
+        UsedCaches().swap(m_usedCaches);
+    }
+
+    void setSkipCount(Count skips) {
+        m_skipCount = skips;
     }
 
     void solve() {
+        // Construct video data object, we use this to calculate goodness later.
         VideoData vd;
         for (Endpoint connection : m_data.caches[m_id].connections) {
             for (Request request : connection.requests) {
-                bool shouldContinue = false;
-                for (auto usedCache : m_usedCaches) {
-                    if (std::find(usedCache.second.begin(), usedCache.second.end(), request.videoId) != usedCache.second.end()) {
-                        shouldContinue = true;
-                        break;
-                    }
-                }
-                if (shouldContinue) continue;
+                // If the cache we are considering already has the video, skip.
+                auto& usedCache = std::find_if(m_usedCaches.begin(), m_usedCaches.end(), [&](const UsedCache& usedCache) {
+                    return usedCache.first == m_id;
+                });
+                if (usedCache != m_usedCaches.end() && std::find(usedCache->second.begin(), usedCache->second.end(), request.videoId) != usedCache->second.end()) continue;
 
                 auto& it = vd.find(request.videoId);
                 if (it == vd.end()) {
@@ -430,7 +476,8 @@ public:
             }
         }
 
-        std::unordered_map<size_t, double> temp;
+        // Kinda sucks but ceebs fixing for now.
+        std::unordered_map<ID, double> temp;
         for (Endpoint connection : m_data.caches[m_id].connections) {
             for (Request request : connection.requests) {
                 auto& datumIt = vd.find(request.videoId);
@@ -450,20 +497,28 @@ public:
             vpl.insert({ it->second, it->first });
         }
 
+        m_result = HPVSResponse(0, false);
+        Count skips = 0;
         auto& it = vpl.begin();
         while (it != vpl.end()) {
             if (m_data.caches[m_id].remainingSpace > m_data.videos[it->second].size) {
-                m_result = vpl.begin()->second;
+                if (skips != m_skipCount) {
+                    ++it;
+                    ++skips;
+                    continue;
+                }
+                m_result = HPVSResponse(it->second, true);
                 break;
             }
             ++it;
         }
     }
 private:
-    Data         m_data;
-    NearestTimes m_nearestTimes;
-    UsedCaches   m_usedCaches;
-    size_t       m_id;
+    Data          m_data;
+    EndpointTimes m_nearestTimes;
+    UsedCaches    m_usedCaches;
+    size_t        m_id;
+    Count         m_skipCount;
 };
 
 bool cachesFull(Data data) {
@@ -473,38 +528,84 @@ bool cachesFull(Data data) {
     return true;
 }
 
-int main() {
+void doThatShit(std::string filename) {
     Loader loader;
-    loader.init("kittens.in");
+    loader.init(filename + ".in");
 
     Data data = loader.getData();
 
     UsedCaches usedCaches;
-    
+
     do {
-        NearestTimes nt = getTimeToNearestStore(data, usedCaches);
+        EndpointTimes nt = getTimeToNearestStore(data, usedCaches);
 
         HighestPriorityCacheSolver hpcs;
-        hpcs.init(data, nt, usedCaches, 1.0);
-        hpcs.solve();
+        hpcs.init(data, nt, usedCaches, 0.0001);
 
-        size_t cache = hpcs.getResult();
 
-        HighestPriorityVideoSolver hpvs;
-        hpvs.init(data, nt, usedCaches, cache);
-        hpvs.solve();
+        HPCSResponse cacheResponse;
+        HPVSResponse videoResponse;
+        bool  skipMaxExceededForCache = false;
+        bool  skipMaxExceededForVideo = false;
+        Count skipsForCache = 0;
+        Count skipsForVideo = 0;
+        do {
+            skipMaxExceededForVideo = false;
 
-        size_t video = hpvs.getResult();
+            hpcs.setSkipCount(skipsForCache);
+            hpcs.solve();
 
-        if (usedCaches.find(cache) == usedCaches.end()) {
-            usedCaches.insert({ cache,{} });
+            cacheResponse = hpcs.getResult();
+            if (!cacheResponse.second) {
+                ++skipsForCache;
+                if (skipsForCache > 5) {
+                    skipMaxExceededForCache = true;
+                    break;
+                }
+                continue;
+            }
+
+            HighestPriorityVideoSolver hpvs;
+            hpvs.init(data, nt, usedCaches, cacheResponse.first);
+
+            while (true) {
+                hpvs.setSkipCount(skipsForVideo);
+                hpvs.solve();
+
+                videoResponse = hpvs.getResult();
+                if (videoResponse.second) break;
+
+                ++skipsForVideo;
+                if (skipsForVideo > 5) {
+                    skipMaxExceededForVideo = true;
+                    break;
+                }
+            }
+            hpvs.dispose();
+
+            if (skipMaxExceededForVideo) {
+                ++skipsForCache;
+                if (skipsForCache > 5) {
+                    skipMaxExceededForCache = true;
+                    break;
+                }
+            }
+        } while (!cacheResponse.second || !videoResponse.second);
+        hpcs.dispose();
+
+        if (skipMaxExceededForCache || !videoResponse.second) break;
+        //if (skipMaxExceededForCache) break;
+
+        if (usedCaches.find(cacheResponse.first) == usedCaches.end()) {
+            usedCaches.insert({ cacheResponse.first,{} });
         }
-        usedCaches[cache].push_back(video);
+        usedCaches[cacheResponse.first].push_back(videoResponse.first);
 
-        data.caches[cache].remainingSpace -= data.videos[video].size;
+        data.caches[cacheResponse.first].remainingSpace -= data.videos[videoResponse.first].size;
     } while (!cachesFull(data));
 
-    std::fstream file("OUTPUT.txt", std::ios::out);
+    std::fstream file(filename + ".txt", std::ios::out);
+    file << usedCaches.size() << "\n";
     for (auto usedCache : usedCaches) {
         file << usedCache.first;
         for (auto i : usedCache.second) {
@@ -513,6 +614,11 @@ int main() {
         file << "\n";
     }
     file.close();
+}
+
+int main() {
+    doThatShit("me_at_the_zoo");
+    doThatShit("videos_worth_spreading");
 
     std::cout << "Press any key to exit..." << std::endl;
     getchar();
